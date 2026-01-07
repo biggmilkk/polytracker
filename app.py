@@ -21,6 +21,12 @@ DEFAULT_KEYWORDS = [
     "nuclear", "ceasefire", "detain", "extradition",
 ]
 
+# A browser-like header helps a lot on hosted environments
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Streamlit; +https://streamlit.io) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+}
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -38,9 +44,6 @@ def _pct(x: float) -> str:
         return "—"
     return f"{x*100:.1f}%"
 
-def _clip01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
-
 def _mad(x: np.ndarray) -> float:
     """Median absolute deviation (robust volatility proxy)."""
     x = x[np.isfinite(x)]
@@ -55,7 +58,12 @@ def _mad(x: np.ndarray) -> float:
 @st.cache_data(ttl=30)
 def clob_midpoint(token_id: str) -> Optional[float]:
     """GET /midpoint?token_id=... -> {"mid": "0.65"}"""
-    r = requests.get(f"{CLOB_BASE}/midpoint", params={"token_id": token_id}, timeout=15)
+    r = requests.get(
+        f"{CLOB_BASE}/midpoint",
+        params={"token_id": token_id},
+        timeout=15,
+        headers=DEFAULT_HEADERS,
+    )
     if r.status_code != 200:
         return None
     j = r.json()
@@ -66,10 +74,14 @@ def clob_prices_history(token_id: str, interval: str = "1w", fidelity_min: int =
     """
     GET /prices-history?market=<token>&interval=1w&fidelity=5
     Response: {"history":[{"t":..., "p":...}, ...]}
-    interval options include 1m, 1h, 6h, 1d, 1w, max; fidelity is minutes.
     """
     params = {"market": token_id, "interval": interval, "fidelity": fidelity_min}
-    r = requests.get(f"{CLOB_BASE}/prices-history", params=params, timeout=20)
+    r = requests.get(
+        f"{CLOB_BASE}/prices-history",
+        params=params,
+        timeout=20,
+        headers=DEFAULT_HEADERS,
+    )
     r.raise_for_status()
     hist = r.json().get("history", [])
     df = pd.DataFrame(hist)
@@ -81,33 +93,37 @@ def clob_prices_history(token_id: str, interval: str = "1w", fidelity_min: int =
     return df
 
 @st.cache_data(ttl=900)
-def gamma_markets_page(limit: int = 200, offset: int = 0) -> List[dict]:
-    """
-    GET https://gamma-api.polymarket.com/markets?limit=...&offset=...
-    (Kept for reference / fallback; discovery uses /public-search instead.)
-    """
-    r = requests.get(f"{GAMMA_BASE}/markets", params={"limit": limit, "offset": offset}, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(ttl=900)
 def gamma_public_search(
     q: str,
     page: int = 0,
     limit_per_type: int = 50,
     keep_closed_markets: int = 0,
+    events_status: str = "active",
+    cache: bool = True,
+    optimized: bool = True,
 ) -> dict:
     """
     GET https://gamma-api.polymarket.com/public-search?q=...
-    Returns JSON with 'events', and each event contains 'markets'.
+    In hosted environments, adding headers + cache/optimized helps avoid empty results.
     """
     params = {
         "q": q,
         "page": page,
         "limit_per_type": limit_per_type,
         "keep_closed_markets": keep_closed_markets,
+        "events_status": events_status,
+        "cache": str(cache).lower(),
+        "optimized": str(optimized).lower(),
+        # Make intent explicit: we only care about events/markets
+        "search_tags": "false",
+        "search_profiles": "false",
     }
-    r = requests.get(f"{GAMMA_BASE}/public-search", params=params, timeout=25)
+    r = requests.get(
+        f"{GAMMA_BASE}/public-search",
+        params=params,
+        timeout=25,
+        headers=DEFAULT_HEADERS,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -116,7 +132,7 @@ def data_holders_for_condition_ids(condition_ids: List[str], limit: int = 20, mi
     """
     GET /holders?market=<comma-separated condition IDs>&limit=20&minBalance=...
     Returns list like: [{"token": "...", "holders":[...]}]
-    Note: the API expects condition IDs via `market` parameter.
+    Note: this endpoint uses condition IDs in the 'market' query param.
     """
     if not condition_ids:
         return []
@@ -125,7 +141,12 @@ def data_holders_for_condition_ids(condition_ids: List[str], limit: int = 20, mi
         "limit": limit,
         "minBalance": min_balance,
     }
-    r = requests.get(f"{DATA_BASE}/holders", params=params, timeout=20)
+    r = requests.get(
+        f"{DATA_BASE}/holders",
+        params=params,
+        timeout=20,
+        headers=DEFAULT_HEADERS,
+    )
     if r.status_code != 200:
         return []
     return r.json()
@@ -147,7 +168,7 @@ class TrackedMarket:
     enable_orderbook: bool
 
 # -----------------------------
-# Discovery helpers
+# Discovery
 # -----------------------------
 def _extract_title(m: dict) -> str:
     return m.get("question") or m.get("title") or m.get("name") or "(untitled)"
@@ -180,34 +201,51 @@ def discover_markets(
     max_pages: int = 3,
     limit_per_type: int = 50,
     keep_closed_markets: bool = False,
-) -> List[TrackedMarket]:
+    debug: bool = False,
+) -> Tuple[List[TrackedMarket], Optional[dict]]:
     """
-    Use Gamma /public-search (keyword search) instead of paging /markets.
-    This reliably finds markets matching your text keywords.
+    Use Gamma /public-search for text discovery.
+    Returns: (markets, debug_payload_for_first_keyword_or_none)
     """
     kws = [k.strip() for k in keywords if k.strip()]
     if not kws:
-        return []
+        return [], None
 
     out: List[TrackedMarket] = []
     seen = set()
     keep_closed = 1 if keep_closed_markets else 0
 
-    for kw in kws:
+    debug_payload = None
+
+    for kw_i, kw in enumerate(kws):
         for page in range(max_pages):
             res = gamma_public_search(
                 q=kw,
                 page=page,
                 limit_per_type=limit_per_type,
                 keep_closed_markets=keep_closed,
+                events_status="active",
+                cache=True,
+                optimized=True,
             )
 
+            # Capture debug only for the very first keyword/page if requested
+            if debug and kw_i == 0 and page == 0 and debug_payload is None:
+                debug_payload = res
+
             events = res.get("events") or []
+            # Some environments might return 'events' as None or a dict; normalize
+            if isinstance(events, dict):
+                events = [events]
+
             if not events:
                 break
 
             for ev in events:
                 markets = ev.get("markets") or []
+                if isinstance(markets, dict):
+                    markets = [markets]
+
                 for m in markets:
                     title = _extract_title(m)
                     slug = (m.get("slug") or "").strip()
@@ -244,18 +282,12 @@ def discover_markets(
             if pag and not pag.get("hasMore", False):
                 break
 
-    return out
+    return out, debug_payload
 
 # -----------------------------
 # Baselines + scoring
 # -----------------------------
 def baseline_from_history(df: pd.DataFrame) -> dict:
-    """
-    Returns baseline stats for anomaly detection:
-      - typical_abs_delta_30m
-      - typical_abs_delta_5m
-      - robust_vol (MAD of returns)
-    """
     if df is None or df.empty or len(df) < 5:
         return {"typ_abs_30m": None, "typ_abs_5m": None, "mad_ret": None}
 
@@ -283,11 +315,6 @@ def baseline_from_history(df: pd.DataFrame) -> dict:
     }
 
 def anomaly_score(current_mid: Optional[float], hist_df: Optional[pd.DataFrame]) -> Tuple[float, dict]:
-    """
-    Score in [0, 100] (roughly) using:
-      - current move over ~30m vs typical
-      - robust volatility proxy
-    """
     if current_mid is None or hist_df is None or hist_df.empty:
         return 0.0, {"reason": "no data"}
 
@@ -323,13 +350,6 @@ def anomaly_score(current_mid: Optional[float], hist_df: Optional[pd.DataFrame])
 # Holders / concentration
 # -----------------------------
 def concentration_metrics(holders_payload: List[dict]) -> dict:
-    """
-    Convert /holders response into simple concentration metrics.
-    We use:
-      - top1_share of sum(topN)
-      - top3_share of sum(topN)
-      - hh_index over topN amounts (normalized)
-    """
     if not holders_payload:
         return {}
 
@@ -356,7 +376,7 @@ def concentration_metrics(holders_payload: List[dict]) -> dict:
     top1 = float(amounts[0] / s)
     top3 = float(amounts[:3].sum() / s) if len(amounts) >= 3 else float(amounts.sum() / s)
     p = amounts / s
-    hhi = float(np.sum(p * p))  # 1.0 is max concentration
+    hhi = float(np.sum(p * p))
 
     return {"top1_share": top1, "top3_share": top3, "hhi": hhi, "n": int(len(amounts))}
 
@@ -372,7 +392,7 @@ if "history_cache" not in st.session_state:
 if "baseline_cache" not in st.session_state:
     st.session_state.baseline_cache: Dict[str, dict] = {}
 if "holders_cache" not in st.session_state:
-    st.session_state.holders_cache: Dict[str, dict] = {}  # condition_id -> metrics+raw timestamp
+    st.session_state.holders_cache: Dict[str, dict] = {}
 if "last_poll" not in st.session_state:
     st.session_state.last_poll = 0.0
 
@@ -391,6 +411,7 @@ with st.sidebar:
     max_pages = st.slider("Discovery pages per keyword", 1, 10, 3)
     limit_per_type = st.slider("Search results per page", 10, 100, 50, step=10)
     keep_closed = st.checkbox("Include closed markets in discovery", value=False)
+    debug_discovery = st.checkbox("Debug discovery (show raw response when empty)", value=True)
 
     poll_seconds = st.slider("Polling interval (seconds)", 30, 600, 120, step=30)
     max_markets = st.slider("Max markets to monitor", 5, 200, 40)
@@ -425,11 +446,12 @@ with tabs[0]:
 
     if do_discover:
         with st.spinner("Searching Gamma markets..."):
-            markets = discover_markets(
+            markets, debug_payload = discover_markets(
                 keywords=keywords,
                 max_pages=max_pages,
                 limit_per_type=limit_per_type,
                 keep_closed_markets=keep_closed,
+                debug=debug_discovery,
             )
 
         def rank(m: TrackedMarket) -> float:
@@ -442,6 +464,10 @@ with tabs[0]:
         markets = sorted(markets, key=rank, reverse=True)
 
         st.write(f"Found **{len(markets)}** matching markets. Showing top 200.")
+        if len(markets) == 0 and debug_discovery and debug_payload is not None:
+            with st.expander("Debug: raw /public-search response (first keyword/page)"):
+                st.json(debug_payload)
+
         df = pd.DataFrame(
             [{
                 "title": m.title,
@@ -472,7 +498,7 @@ with tabs[0]:
         st.info(f"Current watchlist size: {len(st.session_state.watchlist)}")
 
 # -----------------------------
-# Monitor (polling + baselines + conditional holders fetch)
+# Monitor
 # -----------------------------
 with tabs[1]:
     st.subheader("Monitor")
