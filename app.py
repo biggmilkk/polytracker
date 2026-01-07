@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Optional, Tuple
 
 import numpy as np
@@ -17,6 +18,42 @@ CLOB_BASE = "https://clob.polymarket.com"
 MARKET_SLUG = "khamenei-out-as-supreme-leader-of-iran-by-june-30-747"
 
 POLL_SECONDS = 30  # fixed, no UI control
+
+# =========================================================
+# VERSION-SAFE AUTO-REFRESH
+# =========================================================
+def enable_autorefresh(seconds: int) -> None:
+    """
+    Prefer Streamlit's autorefresh if present (some versions expose it as st_autorefresh
+    or via streamlit_autorefresh helper). If unavailable, fall back to sleep+rereun.
+    """
+    interval_ms = int(seconds * 1000)
+
+    # 1) Some Streamlit versions / setups use st_autorefresh instead of autorefresh
+    if hasattr(st, "autorefresh") and callable(getattr(st, "autorefresh")):
+        st.autorefresh(interval=interval_ms, key="poll")
+        return
+
+    if hasattr(st, "st_autorefresh") and callable(getattr(st, "st_autorefresh")):
+        st.st_autorefresh(interval=interval_ms, key="poll")
+        return
+
+    # 2) Optional external helper package (if user installed it)
+    try:
+        from streamlit_autorefresh import st_autorefresh  # type: ignore
+        st_autorefresh(interval=interval_ms, key="poll")
+        return
+    except Exception:
+        pass
+
+    # 3) Universal fallback: sleep then rerun (works on older Streamlit)
+    st.caption(f"Auto-refresh: every {seconds}s (compat mode)")
+    time.sleep(seconds)
+    # experimental_rerun exists on older versions; rerun exists on newer versions
+    if hasattr(st, "rerun") and callable(getattr(st, "rerun")):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 # =========================================================
 # HELPERS
@@ -86,9 +123,6 @@ def trend_label(delta: Optional[float], deadband: float = 0.0025) -> str:
 # =========================================================
 @st.cache_data(ttl=900)
 def gamma_market_by_slug(slug: str) -> Optional[dict]:
-    """
-    Full market object (includes conditionId, clobTokenIds, etc.)
-    """
     r = requests.get(f"{GAMMA_BASE}/markets/slug/{slug}", timeout=20)
     if r.status_code != 200:
         return None
@@ -97,9 +131,6 @@ def gamma_market_by_slug(slug: str) -> Optional[dict]:
 
 @st.cache_data(ttl=15)
 def clob_midpoint(token_id: str) -> Optional[float]:
-    """
-    YES/NO midpoint from Polymarket CLOB
-    """
     r = requests.get(
         f"{CLOB_BASE}/midpoint",
         params={"token_id": token_id},
@@ -110,21 +141,10 @@ def clob_midpoint(token_id: str) -> Optional[float]:
     return safe_float(r.json().get("mid"))
 
 @st.cache_data(ttl=600)
-def clob_price_history(
-    token_id: str,
-    interval: str = "1w",
-    fidelity_min: int = 15,
-) -> pd.DataFrame:
-    """
-    Price history for trend detection
-    """
+def clob_price_history(token_id: str, interval: str = "1w", fidelity_min: int = 15) -> pd.DataFrame:
     r = requests.get(
         f"{CLOB_BASE}/prices-history",
-        params={
-            "market": token_id,
-            "interval": interval,
-            "fidelity": fidelity_min,
-        },
+        params={"market": token_id, "interval": interval, "fidelity": fidelity_min},
         timeout=20,
     )
     r.raise_for_status()
@@ -132,29 +152,18 @@ def clob_price_history(
     df = pd.DataFrame(hist)
     if df.empty:
         return pd.DataFrame(columns=["ts", "price"])
-
     df["ts"] = pd.to_datetime(df["t"], unit="s", utc=True)
     df["price"] = pd.to_numeric(df["p"], errors="coerce")
     return df[["ts", "price"]].dropna().sort_values("ts")
 
-def compute_trend(
-    hist: pd.DataFrame,
-    lookback_minutes: int = 60,
-) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns:
-      current_price, delta_vs_lookback
-    """
+def compute_trend(hist: pd.DataFrame, lookback_minutes: int = 60) -> Tuple[Optional[float], Optional[float]]:
     if hist.empty:
         return None, None
-
     now = pd.Timestamp.now(tz="UTC")
     current = float(hist.iloc[-1]["price"])
-
     target = now - pd.Timedelta(minutes=lookback_minutes)
     older = hist[hist["ts"] <= target]
     past = float(older.iloc[-1]["price"]) if not older.empty else float(hist.iloc[0]["price"])
-
     return current, current - past
 
 # =========================================================
@@ -163,36 +172,45 @@ def compute_trend(
 st.set_page_config(page_title="Polymarket Tracker", layout="wide")
 st.title("Polymarket Tracker")
 
-# Native auto-refresh (Streamlit ≥ 1.27)
-st.autorefresh(interval=POLL_SECONDS * 1000, key="poll")
-
+# Show version (helps you confirm what runtime is actually using)
 with st.sidebar:
-    st.caption(f"Auto-refresh every {POLL_SECONDS} seconds")
+    st.caption(f"Streamlit runtime version: {st.__version__}")
     debug = st.checkbox("Show debug")
+    if st.button("Hard refresh now"):
+        st.cache_data.clear()
+        if hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            st.experimental_rerun()
+
+# Enable refresh (fixed 30s)
+enable_autorefresh(POLL_SECONDS)
 
 # ---------------------------------------------------------
 # LOAD MARKET
 # ---------------------------------------------------------
 market = gamma_market_by_slug(MARKET_SLUG)
 if not market:
-    st.error("Failed to load market from Polymarket.")
+    st.error("Failed to load market from Polymarket (Gamma).")
     st.stop()
 
 question = market.get("question", "(no title)")
-end_date = market.get("endDateIso") or market.get("endDate")
-volume = market.get("volumeNum") or market.get("volume")
+end_date = market.get("endDateIso") or market.get("endDate") or "—"
+volume = market.get("volumeNum") or market.get("volume") or "—"
 
 yes_token, no_token = extract_yes_no_tokens(market)
 if not yes_token:
-    st.error("YES token ID not found.")
+    st.error("YES token ID not found (clobTokenIds missing/unparseable).")
+    if debug:
+        st.json(market)
     st.stop()
 
 # ---------------------------------------------------------
 # DATA
 # ---------------------------------------------------------
 yes_mid = clob_midpoint(yes_token)
-hist = clob_price_history(yes_token)
-current_hist_price, delta_1h = compute_trend(hist, lookback_minutes=60)
+hist = clob_price_history(yes_token, interval="1w", fidelity_min=15)
+_, delta_1h = compute_trend(hist, lookback_minutes=60)
 
 # ---------------------------------------------------------
 # DASHBOARD
@@ -200,26 +218,12 @@ current_hist_price, delta_1h = compute_trend(hist, lookback_minutes=60)
 st.subheader("Dashboard")
 
 c1, c2, c3, c4 = st.columns(4)
+c1.metric("Market", question)
+c2.metric("Leaning", leaning_label(yes_mid))
+c3.metric("Trend (1h)", trend_label(delta_1h), delta=pct(delta_1h))
+c4.metric("YES (now)", pct(yes_mid))
 
-with c1:
-    st.metric("Market", question)
-
-with c2:
-    st.metric("Leaning", leaning_label(yes_mid))
-
-with c3:
-    st.metric(
-        "Trend (1h)",
-        trend_label(delta_1h),
-        delta=pct(delta_1h),
-    )
-
-with c4:
-    st.metric("YES (now)", pct(yes_mid))
-
-st.caption(
-    "Leaning = YES vs 50%. Trend = change in YES probability over the last hour."
-)
+st.caption("Leaning = YES vs 50%. Trend = change in YES probability over the last hour (from price history).")
 
 st.divider()
 
@@ -229,21 +233,18 @@ st.divider()
 st.subheader("Details")
 
 d1, d2, d3 = st.columns(3)
-
-with d1:
-    st.metric("YES", pct(yes_mid))
-
-with d2:
-    st.metric("NO", pct(1 - yes_mid if yes_mid is not None else None))
-
-with d3:
-    st.metric("End date", str(end_date))
+d1.metric("YES", pct(yes_mid))
+d2.metric("NO", pct(1 - yes_mid if yes_mid is not None else None))
+d3.metric("End date", str(end_date))
 
 st.write(f"Volume: {volume}")
 
 st.markdown("### YES price history")
-st.line_chart(hist.set_index("ts")["price"])
+if hist.empty:
+    st.info("No history returned.")
+else:
+    st.line_chart(hist.set_index("ts")["price"])
 
 if debug:
-    st.markdown("### Debug")
+    st.markdown("### Debug market JSON")
     st.json(market)
