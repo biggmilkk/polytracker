@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh  # same as your weathermonitor app
+from streamlit_autorefresh import st_autorefresh
 
 # =========================================================
 # CONFIG
@@ -39,7 +39,6 @@ def pct(x: Optional[float], digits: int = 2) -> str:
     return f"{x * 100:.{digits}f}%"
 
 def as_list(x) -> list:
-    """Normalize list-ish fields (actual list OR JSON-encoded list string)."""
     if x is None:
         return []
     if isinstance(x, list):
@@ -80,10 +79,6 @@ def trend_label(delta: Optional[float], deadband: float = 0.0025) -> str:
     return "Flat"
 
 def compute_trend(hist: pd.DataFrame, lookback_minutes: int = 60) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns (current_price, delta_vs_lookback).
-    delta = current - price_at_or_before(now - lookback)
-    """
     if hist is None or hist.empty:
         return None, None
     now = pd.Timestamp.now(tz="UTC")
@@ -93,15 +88,8 @@ def compute_trend(hist: pd.DataFrame, lookback_minutes: int = 60) -> Tuple[Optio
     past = float(older.iloc[-1]["price"]) if not older.empty else float(hist.iloc[0]["price"])
     return current, current - past
 
-def run_async(coro):
-    """
-    Streamlit typically runs without an active asyncio loop, so asyncio.run is fine.
-    This helper keeps it tidy.
-    """
-    return asyncio.run(coro)
-
 # =========================================================
-# API (sync) + async wrappers
+# API (sync)
 # =========================================================
 @st.cache_data(ttl=900)
 def gamma_market_by_slug(slug: str) -> Optional[dict]:
@@ -126,7 +114,7 @@ def _sync_clob_midpoint(token_id: str) -> Optional[float]:
         return None
     return safe_float(r.json().get("mid"))
 
-def _sync_clob_price_history(token_id: str, interval: str = "1w", fidelity_min: int = 15) -> pd.DataFrame:
+def _sync_clob_price_history(token_id: str, interval="1w", fidelity_min=15) -> pd.DataFrame:
     r = requests.get(
         f"{CLOB_BASE}/prices-history",
         params={"market": token_id, "interval": interval, "fidelity": fidelity_min},
@@ -142,12 +130,14 @@ def _sync_clob_price_history(token_id: str, interval: str = "1w", fidelity_min: 
     df["price"] = pd.to_numeric(df["p"], errors="coerce")
     return df[["ts", "price"]].dropna().sort_values("ts")
 
+# =========================================================
+# ASYNC WRAPPERS
+# =========================================================
 async def clob_midpoint_async(token_id: str) -> Optional[float]:
     return await asyncio.to_thread(_sync_clob_midpoint, token_id)
 
 async def clob_history_async(token_id: str) -> pd.DataFrame:
-    # cheap baseline for “trend”: 1w window, 15m fidelity
-    return await asyncio.to_thread(_sync_clob_price_history, token_id, "1w", 15)
+    return await asyncio.to_thread(_sync_clob_price_history, token_id)
 
 async def fetch_market_snapshot(slug: str) -> Dict:
     market = gamma_market_by_slug(slug)
@@ -162,30 +152,30 @@ async def fetch_market_snapshot(slug: str) -> Dict:
     if not yes_token:
         return {"slug": slug, "title": title, "error": "missing YES token id"}
 
-    # concurrent fetch
     mid_task = asyncio.create_task(clob_midpoint_async(yes_token))
     hist_task = asyncio.create_task(clob_history_async(yes_token))
 
     yes_mid = await mid_task
     hist = await hist_task
-    _, delta_1h = compute_trend(hist, lookback_minutes=60)
+    _, delta_1h = compute_trend(hist, 60)
 
     return {
         "slug": slug,
         "title": title,
         "end_date": end_date,
         "volume": volume,
-        "yes_token": yes_token,
-        "no_token": no_token,
         "yes_mid": yes_mid,
         "delta_1h": delta_1h,
         "leaning": leaning_label(yes_mid),
         "trend": trend_label(delta_1h),
-        "hist": hist,
+        "hist": hist if isinstance(hist, pd.DataFrame) and not hist.empty else None,
     }
 
 async def fetch_all_snapshots(slugs: List[str]) -> List[Dict]:
     return await asyncio.gather(*[fetch_market_snapshot(s) for s in slugs])
+
+def run_async(coro):
+    return asyncio.run(coro)
 
 # =========================================================
 # UI
@@ -193,12 +183,12 @@ async def fetch_all_snapshots(slugs: List[str]) -> List[Dict]:
 st.set_page_config(page_title="Polytracker", layout="wide")
 st.title("Polymarket Tracker")
 
-# ✅ Same approach as your working app: streamlit_autorefresh
+# Auto-refresh (same as your working app)
 st_autorefresh(interval=POLL_SECONDS * 1000, key="auto_refresh_polytracker")
 
 with st.sidebar:
-    st.caption(f"Streamlit version: {st.__version__}")
-    st.caption(f"Auto-refresh: every {POLL_SECONDS}s")
+    st.caption(f"Streamlit {st.__version__}")
+    st.caption(f"Auto-refresh: {POLL_SECONDS}s")
 
     slugs_text = st.text_area(
         "Market slugs (one per line)",
@@ -206,7 +196,6 @@ with st.sidebar:
         height=120,
     )
     slugs = [s.strip() for s in slugs_text.splitlines() if s.strip()]
-
     debug = st.checkbox("Show debug", value=False)
 
 if not slugs:
@@ -216,9 +205,9 @@ if not slugs:
 with st.spinner(f"Fetching {len(slugs)} market(s)..."):
     snapshots = run_async(fetch_all_snapshots(slugs))
 
-# -----------------------------
-# Dashboard
-# -----------------------------
+# =========================================================
+# DASHBOARD
+# =========================================================
 st.subheader("Dashboard")
 
 rows = []
@@ -231,7 +220,6 @@ for s in snapshots:
             "YES now": "—",
             "Δ 1h": "—",
             "Status": f"Error: {s['error']}",
-            "_slug": s["slug"],
         })
     else:
         rows.append({
@@ -241,42 +229,39 @@ for s in snapshots:
             "YES now": pct(s["yes_mid"]),
             "Δ 1h": pct(s["delta_1h"]),
             "Status": "OK",
-            "_slug": s["slug"],
         })
 
 df = pd.DataFrame(rows)
-st.dataframe(df[["Market", "Leaning", "Trend (1h)", "YES now", "Δ 1h", "Status"]], use_container_width=True)
-st.caption("Leaning = YES vs 50%. Trend = change in YES probability over the last hour (from price history).")
+st.dataframe(df, width="stretch")
 
-# -----------------------------
-# Details
-# -----------------------------
+st.caption("Leaning = YES vs 50%. Trend = change in YES probability over the last hour.")
+
+# =========================================================
+# DETAILS
+# =========================================================
 st.subheader("Details")
 
 valid = [s for s in snapshots if not s.get("error")]
 if not valid:
-    st.info("No valid markets to show details for.")
-    if debug:
-        st.json(snapshots)
+    st.info("No valid markets.")
     st.stop()
 
-pick = st.selectbox("Choose a market", options=valid, format_func=lambda x: x["title"])
+pick = st.selectbox("Choose a market", valid, format_func=lambda x: x["title"])
 
 c1, c2, c3 = st.columns(3)
 c1.metric("YES (now)", pct(pick.get("yes_mid")))
-c2.metric("Leaning", pick.get("leaning", "—"))
-c3.metric("Trend (1h)", pick.get("trend", "—"), delta=pct(pick.get("delta_1h")))
+c2.metric("Leaning", pick.get("leaning"))
+c3.metric("Trend (1h)", pick.get("trend"), delta=pct(pick.get("delta_1h")))
 
 st.write(f"End date: {pick.get('end_date')}")
 st.write(f"Volume: {pick.get('volume')}")
 
+st.markdown("### YES price history")
 hist = pick.get("hist")
-st.markdown("### YES price history (1w, 15m fidelity)")
 if isinstance(hist, pd.DataFrame) and not hist.empty:
     st.line_chart(hist.set_index("ts")["price"])
 else:
-    st.info("No history returned.")
+    st.info("No history available.")
 
 if debug:
-    st.markdown("### Debug (selected snapshot)")
-    st.json({k: v for k, v in pick.items() if k != "hist"})
+    st.json(pick)
