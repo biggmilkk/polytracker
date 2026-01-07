@@ -15,6 +15,8 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
 POLL_SECONDS = 30
+TILES_PER_ROW = 7  # fixed as requested
+
 DEFAULT_SLUGS = [
     "khamenei-out-as-supreme-leader-of-iran-by-june-30-747",
 ]
@@ -23,6 +25,14 @@ DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Streamlit)",
     "Accept": "application/json,text/plain,*/*",
 }
+
+# Trend/sparkline for dashboard: keep it light
+DASH_INTERVAL = "1d"
+DASH_FIDELITY_MIN = 5  # minutes
+
+# Details view: heavier history
+DETAIL_INTERVAL = "max"
+DETAIL_FIDELITY_MIN = 30  # minutes
 
 # =========================================================
 # HELPERS
@@ -88,7 +98,7 @@ def clamp01(x: Optional[float]) -> float:
         return 0.0
     return float(max(0.0, min(1.0, x)))
 
-def compute_delta_1h(hist: pd.DataFrame, lookback_minutes: int = 60) -> Optional[float]:
+def compute_delta(hist: pd.DataFrame, lookback_minutes: int = 60) -> Optional[float]:
     if hist is None or hist.empty:
         return None
     now = pd.Timestamp.now(tz="UTC")
@@ -99,9 +109,6 @@ def compute_delta_1h(hist: pd.DataFrame, lookback_minutes: int = 60) -> Optional
     return current - past
 
 def pill(text: str, kind: str) -> str:
-    """
-    kind: "yes", "no", "flat", "muted"
-    """
     colors = {
         "yes": ("#0f5132", "#d1e7dd"),
         "no": ("#842029", "#f8d7da"),
@@ -123,7 +130,7 @@ def pill(text: str, kind: str) -> str:
     """
 
 # =========================================================
-# API (sync)
+# API (cached)
 # =========================================================
 @st.cache_data(ttl=900)
 def gamma_market_by_slug(slug: str) -> Optional[dict]:
@@ -148,10 +155,10 @@ def _sync_midpoint(token_id: str) -> Optional[float]:
         return None
     return safe_float(r.json().get("mid"))
 
-def _sync_history(token_id: str) -> pd.DataFrame:
+def _sync_history(token_id: str, interval: str, fidelity_min: int) -> pd.DataFrame:
     r = requests.get(
         f"{CLOB_BASE}/prices-history",
-        params={"market": token_id, "interval": "1w", "fidelity": 15},
+        params={"market": token_id, "interval": interval, "fidelity": fidelity_min},
         timeout=20,
         headers=DEFAULT_HEADERS,
     )
@@ -163,8 +170,12 @@ def _sync_history(token_id: str) -> pd.DataFrame:
     df["price"] = pd.to_numeric(df["p"], errors="coerce")
     return df[["ts", "price"]].dropna().sort_values("ts")
 
+@st.cache_data(ttl=600)
+def detail_history_cached(token_id: str) -> pd.DataFrame:
+    return _sync_history(token_id, DETAIL_INTERVAL, DETAIL_FIDELITY_MIN)
+
 # =========================================================
-# ASYNC SNAPSHOTS
+# ASYNC SNAPSHOTS (dashboard-light)
 # =========================================================
 async def fetch_snapshot(slug: str) -> Dict:
     market = gamma_market_by_slug(slug)
@@ -175,34 +186,35 @@ async def fetch_snapshot(slug: str) -> Dict:
     end_date = market.get("endDateIso") or market.get("endDate") or "—"
     volume = market.get("volumeNum") or market.get("volume") or "—"
 
-    yes_token, _ = extract_yes_no_tokens(market)
+    yes_token, no_token = extract_yes_no_tokens(market)
     if not yes_token:
         return {"slug": slug, "title": title, "error": "missing YES token id"}
 
-    # concurrent I/O using threads (no aiohttp/httpx needed)
+    # Concurrent I/O (threaded) for speed as you scale markets
     mid_task = asyncio.to_thread(_sync_midpoint, yes_token)
-    hist_task = asyncio.to_thread(_sync_history, yes_token)
+    hist_task = asyncio.to_thread(_sync_history, yes_token, DASH_INTERVAL, DASH_FIDELITY_MIN)
     yes_mid, hist = await asyncio.gather(mid_task, hist_task)
 
-    delta_1h = compute_delta_1h(hist, 60)
+    delta_1h = compute_delta(hist, 60)
 
     return {
         "slug": slug,
         "title": title,
         "end_date": end_date,
         "volume": volume,
+        "yes_token": yes_token,
+        "no_token": no_token,
         "yes_mid": yes_mid,
         "delta_1h": delta_1h,
         "leaning": leaning_label(yes_mid),
         "trend": trend_label(delta_1h),
-        "hist": hist,
+        "hist_light": hist,  # used for sparkline only
     }
 
 async def fetch_all(slugs: List[str]) -> List[Dict]:
     return await asyncio.gather(*(fetch_snapshot(s) for s in slugs))
 
 def run_coro(coro):
-    # Streamlit script thread usually has no running loop -> asyncio.run is correct.
     return asyncio.run(coro)
 
 # =========================================================
@@ -211,23 +223,25 @@ def run_coro(coro):
 st.set_page_config(page_title="Polytracker", layout="wide")
 st.title("Polymarket Tracker")
 
-# Refresh tick (no blocking)
+# Auto-refresh tick (non-blocking)
 st_autorefresh(interval=POLL_SECONDS * 1000, key="auto_refresh_polytracker")
 
+# Session defaults
 if "selected_slug" not in st.session_state:
     st.session_state.selected_slug = None
+if "details_open" not in st.session_state:
+    st.session_state.details_open = False
 
 with st.sidebar:
-    st.caption(f"Auto-refresh: {POLL_SECONDS}s")
+    st.caption(f"Auto-refresh: every {POLL_SECONDS}s")
     slugs_text = st.text_area(
         "Market slugs (one per line)",
         value="\n".join(DEFAULT_SLUGS),
-        height=140,
+        height=160,
     )
     slugs = [s.strip() for s in slugs_text.splitlines() if s.strip()]
-    tiles_per_row = st.slider("Tiles per row", 1, 4, 3)
     spark_points = st.slider("Sparkline points", 10, 120, 40, step=10)
-    show_volume = st.checkbox("Show volume/end date on tiles", value=False)
+    show_meta = st.checkbox("Show end/vol on tiles", value=False)
     debug = st.checkbox("Show debug", value=False)
 
 if not slugs:
@@ -237,7 +251,7 @@ if not slugs:
 with st.spinner(f"Fetching {len(slugs)} market(s)..."):
     snapshots = run_coro(fetch_all(slugs))
 
-# Split errors vs ok
+# Build widget-safe lookup
 by_slug: Dict[str, Dict] = {}
 errors: List[Dict] = []
 for s in snapshots:
@@ -247,27 +261,24 @@ for s in snapshots:
         by_slug[s["slug"]] = s
 
 # =========================================================
-# DASHBOARD (TILES)
+# DASHBOARD (TILES, 7 PER ROW)
 # =========================================================
 st.subheader("Dashboard")
 
 if errors:
     with st.expander("Some markets failed to load"):
-        st.write(errors)
+        st.dataframe(pd.DataFrame(errors), width="stretch")
 
 if not by_slug:
     st.info("No valid markets to display.")
     st.stop()
 
-# Tile rendering
 items = list(by_slug.values())
 
 def render_tile(m: Dict):
     yes_mid = m.get("yes_mid")
     delta = m.get("delta_1h")
-    hist = m.get("hist")
 
-    # pills
     lean = m.get("leaning", "—")
     if lean == "Leans YES":
         lean_pill = pill(lean, "yes")
@@ -292,14 +303,12 @@ def render_tile(m: Dict):
     with st.container(border=True):
         st.markdown(f"**{m.get('title','(no title)')}**")
 
-        # top row indicators
         a, b = st.columns([1, 1])
         with a:
             st.markdown(lean_pill, unsafe_allow_html=True)
         with b:
             st.markdown(tr_pill, unsafe_allow_html=True)
 
-        # YES/NO probability + bar
         c1, c2 = st.columns([1, 1])
         with c1:
             st.metric("YES", pct(yes_mid))
@@ -307,30 +316,28 @@ def render_tile(m: Dict):
             st.metric("NO", pct(1 - yes_mid if yes_mid is not None else None))
 
         st.progress(clamp01(yes_mid))
-
-        # delta
         st.caption(f"Δ 1h: {pct(delta)}")
 
-        # optional meta
-        if show_volume:
-            st.caption(f"End: {m.get('end_date','—')}  •  Vol: {m.get('volume','—')}")
+        if show_meta:
+            st.caption(f"End: {m.get('end_date','—')} • Vol: {m.get('volume','—')}")
 
-        # sparkline (last N points)
+        # light sparkline
+        hist = m.get("hist_light")
         if isinstance(hist, pd.DataFrame) and not hist.empty:
             tail = hist.tail(int(spark_points)).set_index("ts")["price"]
             st.line_chart(tail, height=90)
         else:
             st.caption("No history")
 
-        # details button (sets slug, avoids DF in widget state)
+        # Clicking this should open details expander and load details lazily
         if st.button("View details", key=f"view_{m['slug']}"):
             st.session_state.selected_slug = m["slug"]
+            st.session_state.details_open = True
 
-# grid
-cols = tiles_per_row
-for i in range(0, len(items), cols):
-    row = st.columns(cols)
-    for j in range(cols):
+# Create unlimited rows of 7 tiles
+for i in range(0, len(items), TILES_PER_ROW):
+    row = st.columns(TILES_PER_ROW, gap="small")
+    for j in range(TILES_PER_ROW):
         idx = i + j
         if idx >= len(items):
             break
@@ -340,39 +347,44 @@ for i in range(0, len(items), cols):
 st.caption("Leaning = YES vs 50%. Trend = change in YES probability over the last hour (from price history).")
 
 # =========================================================
-# DETAILS
+# DETAILS (COLLAPSED + LAZY)
 # =========================================================
-st.subheader("Details")
+with st.expander("Details", expanded=bool(st.session_state.details_open)):
+    if not st.session_state.selected_slug or st.session_state.selected_slug not in by_slug:
+        st.info("Click **View details** on a tile to load the detailed view.")
+    else:
+        pick_slug = st.session_state.selected_slug
+        pick = by_slug[pick_slug]
 
-# choose slug (string only)
-default_slug = st.session_state.selected_slug if st.session_state.selected_slug in by_slug else list(by_slug.keys())[0]
-pick_slug = st.selectbox(
-    "Choose a market",
-    options=list(by_slug.keys()),
-    index=list(by_slug.keys()).index(default_slug),
-    format_func=lambda k: by_slug[k]["title"],
-)
+        yes_mid = pick.get("yes_mid")
+        delta = pick.get("delta_1h")
 
-pick = by_slug[pick_slug]
-yes_mid = pick.get("yes_mid")
-delta = pick.get("delta_1h")
+        st.markdown(f"### {pick.get('title')}")
 
-c1, c2, c3 = st.columns(3)
-c1.metric("YES (now)", pct(yes_mid))
-c2.metric("Leaning", pick.get("leaning", "—"))
-c3.metric("Trend (1h)", pick.get("trend", "—"), delta=pct(delta))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("YES (now)", pct(yes_mid))
+        c2.metric("Leaning", pick.get("leaning", "—"))
+        c3.metric("Trend (1h)", pick.get("trend", "—"), delta=pct(delta))
 
-st.write(f"End date: {pick.get('end_date')}")
-st.write(f"Volume: {pick.get('volume')}")
+        st.write(f"End date: {pick.get('end_date')}")
+        st.write(f"Volume: {pick.get('volume')}")
 
-st.markdown("### YES price history (1w, 15m fidelity)")
-hist = pick.get("hist")
-if isinstance(hist, pd.DataFrame) and not hist.empty:
-    st.line_chart(hist.set_index("ts")["price"], height=260)
-else:
-    st.info("No history available.")
+        # Lazy-load heavy history ONLY when expander is opened via View details
+        st.markdown("#### YES price history (max, 30m fidelity)")
+        with st.spinner("Loading detailed history..."):
+            hist_full = detail_history_cached(pick["yes_token"])
 
-if debug:
-    st.markdown("### Debug (selected snapshot)")
-    dbg = {k: v for k, v in pick.items() if k != "hist"}
-    st.json(dbg)
+        if isinstance(hist_full, pd.DataFrame) and not hist_full.empty:
+            st.line_chart(hist_full.set_index("ts")["price"], height=260)
+        else:
+            st.info("No detailed history returned.")
+
+        # Optional: allow closing the expander state
+        colA, colB = st.columns([1, 3])
+        with colA:
+            if st.button("Close details"):
+                st.session_state.details_open = False
+
+        if debug:
+            st.markdown("#### Debug snapshot")
+            st.json({k: v for k, v in pick.items() if k != "hist_light"})
