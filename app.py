@@ -74,7 +74,7 @@ def clob_prices_history(token_id: str, interval: str = "1w", fidelity_min: int =
     hist = r.json().get("history", [])
     df = pd.DataFrame(hist)
     if df.empty:
-        return pd.DataFrame(columns=["t", "p", "ts", "price"])
+        return pd.DataFrame(columns=["ts", "price"])
     df["ts"] = pd.to_datetime(df["t"], unit="s", utc=True)
     df["price"] = pd.to_numeric(df["p"], errors="coerce")
     df = df[["ts", "price"]].dropna().sort_values("ts")
@@ -84,8 +84,30 @@ def clob_prices_history(token_id: str, interval: str = "1w", fidelity_min: int =
 def gamma_markets_page(limit: int = 200, offset: int = 0) -> List[dict]:
     """
     GET https://gamma-api.polymarket.com/markets?limit=...&offset=...
+    (Kept for reference / fallback; discovery uses /public-search instead.)
     """
     r = requests.get(f"{GAMMA_BASE}/markets", params={"limit": limit, "offset": offset}, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=900)
+def gamma_public_search(
+    q: str,
+    page: int = 0,
+    limit_per_type: int = 50,
+    keep_closed_markets: int = 0,
+) -> dict:
+    """
+    GET https://gamma-api.polymarket.com/public-search?q=...
+    Returns JSON with 'events', and each event contains 'markets'.
+    """
+    params = {
+        "q": q,
+        "page": page,
+        "limit_per_type": limit_per_type,
+        "keep_closed_markets": keep_closed_markets,
+    }
+    r = requests.get(f"{GAMMA_BASE}/public-search", params=params, timeout=25)
     r.raise_for_status()
     return r.json()
 
@@ -94,8 +116,10 @@ def data_holders_for_condition_ids(condition_ids: List[str], limit: int = 20, mi
     """
     GET /holders?market=<comma-separated condition IDs>&limit=20&minBalance=...
     Returns list like: [{"token": "...", "holders":[...]}]
-    Note: the API expects condition IDs via `market` parameter. :contentReference[oaicite:8]{index=8}
+    Note: the API expects condition IDs via `market` parameter.
     """
+    if not condition_ids:
+        return []
     params = {
         "market": ",".join(condition_ids),
         "limit": limit,
@@ -123,13 +147,12 @@ class TrackedMarket:
     enable_orderbook: bool
 
 # -----------------------------
-# Discovery
+# Discovery helpers
 # -----------------------------
 def _extract_title(m: dict) -> str:
     return m.get("question") or m.get("title") or m.get("name") or "(untitled)"
 
 def _extract_condition_id(m: dict) -> Optional[str]:
-    # Gamma docs describe condition ids; field names may vary in responses.
     return (
         m.get("conditionId")
         or m.get("condition_id")
@@ -138,7 +161,6 @@ def _extract_condition_id(m: dict) -> Optional[str]:
     )
 
 def _extract_tokens(m: dict) -> Tuple[Optional[str], Optional[str]]:
-    # Gamma responses include clobTokenIds (typically YES/NO) :contentReference[oaicite:9]{index=9}
     toks = m.get("clobTokenIds") or m.get("clob_token_ids") or []
     if not isinstance(toks, list) or len(toks) == 0:
         return None, None
@@ -147,59 +169,80 @@ def _extract_tokens(m: dict) -> Tuple[Optional[str], Optional[str]]:
     return yes_id, no_id
 
 def _market_is_open(m: dict) -> bool:
-    # Gamma has multiple status flags; we keep it permissive.
     if "active" in m:
         return bool(m.get("active"))
     if "closed" in m:
         return not bool(m.get("closed"))
     return True
 
-def discover_markets(keywords: List[str], max_pages: int = 5, page_size: int = 200) -> List[TrackedMarket]:
-    kws = [k.strip().lower() for k in keywords if k.strip()]
+def discover_markets(
+    keywords: List[str],
+    max_pages: int = 3,
+    limit_per_type: int = 50,
+    keep_closed_markets: bool = False,
+) -> List[TrackedMarket]:
+    """
+    Use Gamma /public-search (keyword search) instead of paging /markets.
+    This reliably finds markets matching your text keywords.
+    """
+    kws = [k.strip() for k in keywords if k.strip()]
+    if not kws:
+        return []
+
     out: List[TrackedMarket] = []
     seen = set()
+    keep_closed = 1 if keep_closed_markets else 0
 
-    for page in range(max_pages):
-        offset = page * page_size
-        items = gamma_markets_page(limit=page_size, offset=offset)
-        if not items:
-            break
-
-        for m in items:
-            title = _extract_title(m)
-            slug = (m.get("slug") or "").strip()
-            hay = f"{title} {slug}".lower()
-
-            if kws and not any(k in hay for k in kws):
-                continue
-
-            condition_id = _extract_condition_id(m)
-            yes_id, no_id = _extract_tokens(m)
-            if not condition_id or not yes_id:
-                continue
-
-            enable_orderbook = bool(m.get("enableOrderBook", m.get("enable_order_book", True)))
-            is_open = _market_is_open(m)
-
-            market_id = str(m.get("id") or m.get("marketId") or m.get("market_id") or slug or condition_id)
-            if market_id in seen:
-                continue
-            seen.add(market_id)
-
-            out.append(
-                TrackedMarket(
-                    market_id=market_id,
-                    slug=slug,
-                    title=title,
-                    condition_id=condition_id,
-                    yes_token_id=yes_id,
-                    no_token_id=no_id,
-                    liquidity_num=_safe_float(m.get("liquidityNum") or m.get("liquidity_num")),
-                    volume_num=_safe_float(m.get("volumeNum") or m.get("volume_num")),
-                    is_open=is_open,
-                    enable_orderbook=enable_orderbook,
-                )
+    for kw in kws:
+        for page in range(max_pages):
+            res = gamma_public_search(
+                q=kw,
+                page=page,
+                limit_per_type=limit_per_type,
+                keep_closed_markets=keep_closed,
             )
+
+            events = res.get("events") or []
+            if not events:
+                break
+
+            for ev in events:
+                markets = ev.get("markets") or []
+                for m in markets:
+                    title = _extract_title(m)
+                    slug = (m.get("slug") or "").strip()
+
+                    condition_id = _extract_condition_id(m)
+                    yes_id, no_id = _extract_tokens(m)
+                    if not condition_id or not yes_id:
+                        continue
+
+                    enable_orderbook = bool(m.get("enableOrderBook", m.get("enable_order_book", True)))
+                    is_open = _market_is_open(m)
+
+                    market_id = str(m.get("id") or m.get("marketId") or m.get("market_id") or slug or condition_id)
+                    if market_id in seen:
+                        continue
+                    seen.add(market_id)
+
+                    out.append(
+                        TrackedMarket(
+                            market_id=market_id,
+                            slug=slug,
+                            title=title,
+                            condition_id=condition_id,
+                            yes_token_id=yes_id,
+                            no_token_id=no_id,
+                            liquidity_num=_safe_float(m.get("liquidityNum") or m.get("liquidity_num") or m.get("liquidity")),
+                            volume_num=_safe_float(m.get("volumeNum") or m.get("volume_num") or m.get("volume")),
+                            is_open=is_open,
+                            enable_orderbook=enable_orderbook,
+                        )
+                    )
+
+            pag = res.get("pagination") or {}
+            if pag and not pag.get("hasMore", False):
+                break
 
     return out
 
@@ -216,21 +259,16 @@ def baseline_from_history(df: pd.DataFrame) -> dict:
     if df is None or df.empty or len(df) < 5:
         return {"typ_abs_30m": None, "typ_abs_5m": None, "mad_ret": None}
 
-    # assume fidelity already roughly uniform; compute deltas
     prices = df["price"].to_numpy(dtype=float)
-    # returns (differences in prob space)
     d = np.diff(prices)
     if len(d) == 0:
         return {"typ_abs_30m": None, "typ_abs_5m": None, "mad_ret": None}
 
-    # map “steps” into 5m and 30m based on timestamp spacing
     ts = df["ts"].astype("int64").to_numpy() / 1e9
     step = np.median(np.diff(ts)) if len(ts) > 2 else 300.0
-    step = max(60.0, float(step))  # avoid nonsense
+    step = max(60.0, float(step))
     k5 = max(1, int(round(300.0 / step)))
     k30 = max(1, int(round(1800.0 / step)))
-
-    abs_d = np.abs(d)
 
     def _abs_move_k(k: int) -> Optional[float]:
         if len(prices) <= k:
@@ -257,25 +295,19 @@ def anomaly_score(current_mid: Optional[float], hist_df: Optional[pd.DataFrame])
     typ30 = base.get("typ_abs_30m")
     mad_ret = base.get("mad_ret")
 
-    # approximate 30m-ago price from history tail
-    # (history endpoint ends at “now-ish”; we use last timestamp <= now-30m if possible)
     target = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(minutes=30)
-    past = None
     older = hist_df[hist_df["ts"] <= target]
-    if not older.empty:
-        past = float(older.iloc[-1]["price"])
-    else:
-        # fallback: earliest point
-        past = float(hist_df.iloc[0]["price"])
+    past = float(older.iloc[-1]["price"]) if not older.empty else float(hist_df.iloc[0]["price"])
 
     move30 = abs(float(current_mid) - past)
 
-    # normalize
-    denom = typ30 if (typ30 is not None and typ30 > 1e-6) else (mad_ret if (mad_ret is not None and mad_ret > 1e-6) else 0.02)
+    denom = (
+        typ30 if (typ30 is not None and typ30 > 1e-6)
+        else (mad_ret if (mad_ret is not None and mad_ret > 1e-6) else 0.02)
+    )
     z = move30 / denom
 
-    # squash into 0..100
-    score = 100.0 * (1.0 - math.exp(-z / 2.0))  # gentle curve
+    score = 100.0 * (1.0 - math.exp(-z / 2.0))
     score = float(max(0.0, min(100.0, score)))
 
     details = {
@@ -301,7 +333,6 @@ def concentration_metrics(holders_payload: List[dict]) -> dict:
     if not holders_payload:
         return {}
 
-    # payload is list of tokens; we aggregate across returned tokens
     all_amounts = []
     for item in holders_payload:
         holders = item.get("holders") or []
@@ -357,7 +388,10 @@ with st.sidebar:
     ).splitlines()
     keywords = [k.strip() for k in keywords if k.strip()]
 
-    max_pages = st.slider("Discovery pages (200 per page)", 1, 20, 5)
+    max_pages = st.slider("Discovery pages per keyword", 1, 10, 3)
+    limit_per_type = st.slider("Search results per page", 10, 100, 50, step=10)
+    keep_closed = st.checkbox("Include closed markets in discovery", value=False)
+
     poll_seconds = st.slider("Polling interval (seconds)", 30, 600, 120, step=30)
     max_markets = st.slider("Max markets to monitor", 5, 200, 40)
 
@@ -391,9 +425,13 @@ with tabs[0]:
 
     if do_discover:
         with st.spinner("Searching Gamma markets..."):
-            markets = discover_markets(keywords=keywords, max_pages=max_pages, page_size=200)
+            markets = discover_markets(
+                keywords=keywords,
+                max_pages=max_pages,
+                limit_per_type=limit_per_type,
+                keep_closed_markets=keep_closed,
+            )
 
-        # light ranking: prioritize open + orderbook + liquidity/volume
         def rank(m: TrackedMarket) -> float:
             liq = m.liquidity_num or 0.0
             vol = m.volume_num or 0.0
@@ -442,15 +480,12 @@ with tabs[1]:
     if not st.session_state.watchlist:
         st.warning("Your watchlist is empty. Go to Discover and add markets.")
     else:
-        # autorefresh at poll_seconds
         st.caption("This page auto-refreshes for polling. (No websockets, slower + cheaper.)")
         try:
             st.autorefresh(interval=poll_seconds * 1000, key="poll")
         except Exception:
-            # older Streamlit: fallback to manual refresh
             st.button("Refresh now")
 
-        # limit to max_markets (priority: open+orderbook+liq)
         watch = list(st.session_state.watchlist.values())
 
         def watch_rank(m: TrackedMarket) -> float:
@@ -462,12 +497,10 @@ with tabs[1]:
         anomalous_condition_ids = []
 
         for m in watch:
-            token_id = m.yes_token_id  # track YES by default (you can change this logic)
+            token_id = m.yes_token_id
             mid = clob_midpoint(token_id)
 
-            # history/baseline cached per token
             if token_id not in st.session_state.history_cache:
-                # fetch lazily to keep initial polling light
                 hist = clob_prices_history(token_id, interval=hist_interval, fidelity_min=int(fidelity))
                 st.session_state.history_cache[token_id] = hist
                 st.session_state.baseline_cache[token_id] = baseline_from_history(hist)
@@ -475,7 +508,6 @@ with tabs[1]:
             hist_df = st.session_state.history_cache.get(token_id)
             score, details = anomaly_score(mid, hist_df)
 
-            # trigger holders fetch on anomaly
             if score >= score_threshold:
                 anomalous_condition_ids.append(m.condition_id)
 
@@ -496,10 +528,7 @@ with tabs[1]:
 
         df = pd.DataFrame(rows).sort_values("score", ascending=False)
 
-        # Fetch holders for anomalous markets (batched by condition IDs)
-        # Data API expects comma-separated condition IDs via `market` param. :contentReference[oaicite:10]{index=10}
         if anomalous_condition_ids:
-            # only fetch for up to 10 conditions per refresh to keep it cheap
             unique = list(dict.fromkeys(anomalous_condition_ids))[:10]
             payload = data_holders_for_condition_ids(unique, limit=20, min_balance=int(holders_min_balance))
 
@@ -508,7 +537,6 @@ with tabs[1]:
             for cid in unique:
                 st.session_state.holders_cache[cid] = {"ts": ts, "payload": payload, "metrics": metrics}
 
-        # Display
         st.dataframe(
             df.assign(
                 mid=df["mid"].apply(lambda x: _pct(x) if x is not None else "—"),
@@ -522,7 +550,6 @@ with tabs[1]:
 
         st.markdown("#### Concentration (only fetched for markets above the anomaly threshold)")
         if st.session_state.holders_cache:
-            # show latest cache entries
             conc_rows = []
             for cid, obj in st.session_state.holders_cache.items():
                 met = obj.get("metrics", {})
