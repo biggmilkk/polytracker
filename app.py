@@ -21,6 +21,7 @@ DEFAULT_KEYWORDS = [
     "nuclear", "ceasefire", "detain", "extradition",
 ]
 
+# Browser-ish headers help on hosted environments
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Streamlit; +https://streamlit.io) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
     "Accept": "application/json,text/plain,*/*",
@@ -44,7 +45,6 @@ def _pct(x: float) -> str:
     return f"{x*100:.1f}%"
 
 def _mad(x: np.ndarray) -> float:
-    """Median absolute deviation (robust volatility proxy)."""
     x = x[np.isfinite(x)]
     if len(x) == 0:
         return 0.0
@@ -60,7 +60,6 @@ def _chunks(xs: List[str], n: int) -> Iterable[List[str]]:
 # -----------------------------
 @st.cache_data(ttl=30)
 def clob_midpoint(token_id: str) -> Optional[float]:
-    """GET /midpoint?token_id=... -> {"mid": "0.65"}"""
     r = requests.get(
         f"{CLOB_BASE}/midpoint",
         params={"token_id": token_id},
@@ -74,10 +73,6 @@ def clob_midpoint(token_id: str) -> Optional[float]:
 
 @st.cache_data(ttl=600)
 def clob_prices_history(token_id: str, interval: str = "1w", fidelity_min: int = 5) -> pd.DataFrame:
-    """
-    GET /prices-history?market=<token>&interval=1w&fidelity=5
-    Response: {"history":[{"t":..., "p":...}, ...]}
-    """
     params = {"market": token_id, "interval": interval, "fidelity": fidelity_min}
     r = requests.get(
         f"{CLOB_BASE}/prices-history",
@@ -105,11 +100,6 @@ def gamma_public_search(
     cache: bool = True,
     optimized: bool = True,
 ) -> dict:
-    """
-    GET https://gamma-api.polymarket.com/public-search?q=...
-    NOTE: The returned markets often *do not* include clobTokenIds / conditionId,
-    so we use this endpoint only to discover market slugs, then hydrate via /markets.
-    """
     params = {
         "q": q,
         "page": page,
@@ -131,34 +121,29 @@ def gamma_public_search(
     return r.json()
 
 @st.cache_data(ttl=900)
-def gamma_get_markets_by_slugs(slugs: List[str]) -> List[dict]:
+def gamma_market_by_slug(slug: str) -> Optional[dict]:
     """
-    Hydrate markets via /markets?slug[]=...
-    /public-search returns slim market objects; /markets returns full metadata including clobTokenIds.
+    Official endpoint:
+      GET https://gamma-api.polymarket.com/markets/slug/{slug}
+    This returns full market data (incl. clobTokenIds / condition ids). :contentReference[oaicite:1]{index=1}
     """
-    if not slugs:
-        return []
-
-    # requests encodes list params as repeated keys: slug=a&slug=b
-    params = {"slug": slugs, "limit": len(slugs), "offset": 0}
+    if not slug:
+        return None
     r = requests.get(
-        f"{GAMMA_BASE}/markets",
-        params=params,
+        f"{GAMMA_BASE}/markets/slug/{slug}",
         timeout=25,
         headers=DEFAULT_HEADERS,
     )
-    r.raise_for_status()
-    data = r.json()
-    # /markets returns a list
-    return data if isinstance(data, list) else []
+    if r.status_code != 200:
+        return None
+    j = r.json()
+    # Some SDKs return a list; normalize to dict
+    if isinstance(j, list):
+        return j[0] if j else None
+    return j if isinstance(j, dict) else None
 
 @st.cache_data(ttl=900)
 def data_holders_for_condition_ids(condition_ids: List[str], limit: int = 20, min_balance: int = 1) -> List[dict]:
-    """
-    GET /holders?market=<comma-separated condition IDs>&limit=20&minBalance=...
-    Returns list like: [{"token": "...", "holders":[...]}]
-    Note: this endpoint uses condition IDs in the 'market' query param.
-    """
     if not condition_ids:
         return []
     params = {
@@ -199,18 +184,16 @@ def _extract_title(m: dict) -> str:
     return m.get("question") or m.get("title") or m.get("name") or "(untitled)"
 
 def _extract_condition_id(m: dict) -> Optional[str]:
-    # /markets usually has conditionId or conditionIds; sometimes condition_ids
     return (
         m.get("conditionId")
         or m.get("condition_id")
         or (m.get("conditionIds")[0] if isinstance(m.get("conditionIds"), list) and m.get("conditionIds") else None)
         or (m.get("condition_ids")[0] if isinstance(m.get("condition_ids"), list) and m.get("condition_ids") else None)
         or (m.get("condition_ids") if isinstance(m.get("condition_ids"), str) else None)
-        or (m.get("conditionId") if isinstance(m.get("conditionId"), str) else None)
     )
 
 def _extract_tokens(m: dict) -> Tuple[Optional[str], Optional[str]]:
-    toks = m.get("clobTokenIds") or m.get("clob_token_ids") or m.get("clobTokenIDs") or []
+    toks = m.get("clobTokenIds") or m.get("clob_token_ids") or []
     if not isinstance(toks, list) or len(toks) == 0:
         return None, None
     yes_id = str(toks[0])
@@ -245,22 +228,30 @@ def discover_markets(
     limit_per_type: int = 50,
     keep_closed_markets: bool = False,
     debug: bool = False,
-) -> Tuple[List[TrackedMarket], Optional[dict]]:
+) -> Tuple[List[TrackedMarket], dict]:
     """
-    Discovery pipeline:
-      1) public-search -> slugs
-      2) hydrate via /markets?slug[]=... to get clobTokenIds + conditionId
-    Returns (tracked_markets, debug_payload_for_first_keyword_first_page_or_none)
+    Pipeline:
+      1) /public-search -> slugs (slim markets)
+      2) /markets/slug/{slug} -> full market objects (clobTokenIds, condition ids)
     """
     kws = [k.strip() for k in keywords if k.strip()]
-    if not kws:
-        return [], None
-
     keep_closed = 1 if keep_closed_markets else 0
-    debug_payload = None
 
-    # 1) collect slugs via search
+    debug_info = {
+        "slugs_collected": 0,
+        "slugs_sample": [],
+        "hydrated_ok": 0,
+        "hydrated_failed": 0,
+        "hydrated_missing_ids": 0,
+        "example_hydrated_market_keys": None,
+    }
+
+    if not kws:
+        return [], debug_info
+
     all_slugs: List[str] = []
+    first_search_payload = None
+
     for kw_i, kw in enumerate(kws):
         for page in range(max_pages):
             res = gamma_public_search(
@@ -272,8 +263,8 @@ def discover_markets(
                 cache=True,
                 optimized=True,
             )
-            if debug and kw_i == 0 and page == 0 and debug_payload is None:
-                debug_payload = res
+            if debug and kw_i == 0 and page == 0:
+                first_search_payload = res
 
             slugs = _collect_slugs_from_search_payload(res)
             if not slugs:
@@ -286,36 +277,44 @@ def discover_markets(
 
     # de-dupe slugs
     all_slugs = list(dict.fromkeys(all_slugs))
+    debug_info["slugs_collected"] = len(all_slugs)
+    debug_info["slugs_sample"] = all_slugs[:10]
+
+    if debug and first_search_payload is not None:
+        debug_info["first_search_payload"] = first_search_payload
+
     if not all_slugs:
-        return [], debug_payload
+        return [], debug_info
 
-    # 2) hydrate slugs to full market objects
-    hydrated: List[dict] = []
-    # batch size: keep modest to avoid URL length/rate issues
-    for batch in _chunks(all_slugs, 50):
-        try:
-            hydrated.extend(gamma_get_markets_by_slugs(batch))
-        except Exception:
-            # don't kill discovery if a batch fails
-            continue
-
-    # 3) build TrackedMarket objects
     out: List[TrackedMarket] = []
     seen = set()
-    for m in hydrated:
-        title = _extract_title(m)
-        slug = (m.get("slug") or "").strip()
-        condition_id = _extract_condition_id(m)
-        yes_id, no_id = _extract_tokens(m)
 
-        # If hydration still didn't provide ids, skip
-        if not condition_id or not yes_id:
+    # hydrate only up to a reasonable cap to avoid slow discovery
+    # you can increase this if you want
+    hydrate_cap = min(len(all_slugs), 300)
+
+    for slug in all_slugs[:hydrate_cap]:
+        full = gamma_market_by_slug(slug)
+        if not full:
+            debug_info["hydrated_failed"] += 1
             continue
 
-        enable_orderbook = bool(m.get("enableOrderBook", m.get("enable_order_book", True)))
-        is_open = _market_is_open(m)
+        debug_info["hydrated_ok"] += 1
+        if debug_info["example_hydrated_market_keys"] is None:
+            debug_info["example_hydrated_market_keys"] = sorted(list(full.keys()))
 
-        market_id = str(m.get("id") or m.get("marketId") or m.get("market_id") or slug or condition_id)
+        title = _extract_title(full)
+        condition_id = _extract_condition_id(full)
+        yes_id, no_id = _extract_tokens(full)
+
+        if not condition_id or not yes_id:
+            debug_info["hydrated_missing_ids"] += 1
+            continue
+
+        enable_orderbook = bool(full.get("enableOrderBook", full.get("enable_order_book", True)))
+        is_open = _market_is_open(full)
+
+        market_id = str(full.get("id") or full.get("marketId") or full.get("market_id") or slug or condition_id)
         if market_id in seen:
             continue
         seen.add(market_id)
@@ -328,25 +327,19 @@ def discover_markets(
                 condition_id=str(condition_id),
                 yes_token_id=str(yes_id),
                 no_token_id=str(no_id) if no_id is not None else None,
-                liquidity_num=_safe_float(m.get("liquidityNum") or m.get("liquidity_num") or m.get("liquidity")),
-                volume_num=_safe_float(m.get("volumeNum") or m.get("volume_num") or m.get("volume")),
+                liquidity_num=_safe_float(full.get("liquidityNum") or full.get("liquidity_num") or full.get("liquidity")),
+                volume_num=_safe_float(full.get("volumeNum") or full.get("volume_num") or full.get("volume")),
                 is_open=is_open,
                 enable_orderbook=enable_orderbook,
             )
         )
 
-    return out, debug_payload
+    return out, debug_info
 
 # -----------------------------
 # Baselines + scoring
 # -----------------------------
 def baseline_from_history(df: pd.DataFrame) -> dict:
-    """
-    Returns baseline stats for anomaly detection:
-      - typical_abs_delta_30m
-      - typical_abs_delta_5m
-      - robust_vol (MAD of returns)
-    """
     if df is None or df.empty or len(df) < 5:
         return {"typ_abs_30m": None, "typ_abs_5m": None, "mad_ret": None}
 
@@ -374,11 +367,6 @@ def baseline_from_history(df: pd.DataFrame) -> dict:
     }
 
 def anomaly_score(current_mid: Optional[float], hist_df: Optional[pd.DataFrame]) -> Tuple[float, dict]:
-    """
-    Score in [0, 100] (roughly) using:
-      - current move over ~30m vs typical
-      - robust volatility proxy
-    """
     if current_mid is None or hist_df is None or hist_df.empty:
         return 0.0, {"reason": "no data"}
 
@@ -414,13 +402,6 @@ def anomaly_score(current_mid: Optional[float], hist_df: Optional[pd.DataFrame])
 # Holders / concentration
 # -----------------------------
 def concentration_metrics(holders_payload: List[dict]) -> dict:
-    """
-    Convert /holders response into simple concentration metrics.
-    We use:
-      - top1_share of sum(topN)
-      - top3_share of sum(topN)
-      - hh_index over topN amounts (normalized)
-    """
     if not holders_payload:
         return {}
 
@@ -447,7 +428,7 @@ def concentration_metrics(holders_payload: List[dict]) -> dict:
     top1 = float(amounts[0] / s)
     top3 = float(amounts[:3].sum() / s) if len(amounts) >= 3 else float(amounts.sum() / s)
     p = amounts / s
-    hhi = float(np.sum(p * p))  # 1.0 is max concentration
+    hhi = float(np.sum(p * p))
 
     return {"top1_share": top1, "top3_share": top3, "hhi": hhi, "n": int(len(amounts))}
 
@@ -463,9 +444,7 @@ if "history_cache" not in st.session_state:
 if "baseline_cache" not in st.session_state:
     st.session_state.baseline_cache: Dict[str, dict] = {}
 if "holders_cache" not in st.session_state:
-    st.session_state.holders_cache: Dict[str, dict] = {}  # condition_id -> metrics+raw timestamp
-if "last_poll" not in st.session_state:
-    st.session_state.last_poll = 0.0
+    st.session_state.holders_cache: Dict[str, dict] = {}
 
 st.title("Polymarket Geopolitics Tracker (Polling + Baselines + Concentration)")
 
@@ -482,7 +461,7 @@ with st.sidebar:
     max_pages = st.slider("Discovery pages per keyword", 1, 10, 3)
     limit_per_type = st.slider("Search results per page", 10, 100, 50, step=10)
     keep_closed = st.checkbox("Include closed markets in discovery", value=False)
-    debug_discovery = st.checkbox("Debug discovery (show raw search payload)", value=False)
+    debug_discovery = st.checkbox("Debug discovery", value=True)
 
     poll_seconds = st.slider("Polling interval (seconds)", 30, 600, 120, step=30)
     max_markets = st.slider("Max markets to monitor", 5, 200, 40)
@@ -509,14 +488,11 @@ with st.sidebar:
 
 tabs = st.tabs(["Discover", "Monitor", "Market detail"])
 
-# -----------------------------
-# Discover
-# -----------------------------
 with tabs[0]:
     st.subheader("Discover markets from keywords")
 
     if do_discover:
-        with st.spinner("Searching Gamma markets (search → hydrate)..."):
+        with st.spinner("Discovering (search → hydrate slugs)…"):
             markets, dbg = discover_markets(
                 keywords=keywords,
                 max_pages=max_pages,
@@ -525,11 +501,13 @@ with tabs[0]:
                 debug=debug_discovery,
             )
 
-        if debug_discovery and dbg is not None:
-            with st.expander("Debug: raw /public-search payload (first keyword/page)"):
+        st.write(f"Found **{len(markets)}** matching markets. Showing top 200.")
+
+        if debug_discovery:
+            with st.expander("Debug info"):
                 st.json(dbg)
 
-        # light ranking: prioritize open + orderbook + liquidity/volume
+        # ranking
         def rank(m: TrackedMarket) -> float:
             liq = m.liquidity_num or 0.0
             vol = m.volume_num or 0.0
@@ -539,7 +517,6 @@ with tabs[0]:
 
         markets = sorted(markets, key=rank, reverse=True)
 
-        st.write(f"Found **{len(markets)}** matching markets. Showing top 200.")
         df = pd.DataFrame(
             [{
                 "title": m.title,
@@ -569,16 +546,13 @@ with tabs[0]:
     if st.session_state.watchlist:
         st.info(f"Current watchlist size: {len(st.session_state.watchlist)}")
 
-# -----------------------------
-# Monitor (polling + baselines + conditional holders fetch)
-# -----------------------------
 with tabs[1]:
     st.subheader("Monitor")
 
     if not st.session_state.watchlist:
         st.warning("Your watchlist is empty. Go to Discover and add markets.")
     else:
-        st.caption("This page auto-refreshes for polling. (No websockets, slower + cheaper.)")
+        st.caption("This page auto-refreshes for polling.")
         try:
             st.autorefresh(interval=poll_seconds * 1000, key="poll")
         except Exception:
@@ -595,10 +569,9 @@ with tabs[1]:
         anomalous_condition_ids = []
 
         for m in watch:
-            token_id = m.yes_token_id  # track YES by default
+            token_id = m.yes_token_id
             mid = clob_midpoint(token_id)
 
-            # history/baseline cached per token
             if token_id not in st.session_state.history_cache:
                 hist = clob_prices_history(token_id, interval=hist_interval, fidelity_min=int(fidelity))
                 st.session_state.history_cache[token_id] = hist
@@ -607,7 +580,6 @@ with tabs[1]:
             hist_df = st.session_state.history_cache.get(token_id)
             score, details = anomaly_score(mid, hist_df)
 
-            # trigger holders fetch on anomaly
             if score >= score_threshold:
                 anomalous_condition_ids.append(m.condition_id)
 
@@ -628,17 +600,14 @@ with tabs[1]:
 
         df = pd.DataFrame(rows).sort_values("score", ascending=False)
 
-        # Fetch holders for anomalous markets (batched by condition IDs)
         if anomalous_condition_ids:
             unique = list(dict.fromkeys(anomalous_condition_ids))[:10]
             payload = data_holders_for_condition_ids(unique, limit=20, min_balance=int(holders_min_balance))
-
             metrics = concentration_metrics(payload)
             ts = _now()
             for cid in unique:
                 st.session_state.holders_cache[cid] = {"ts": ts, "payload": payload, "metrics": metrics}
 
-        # Display
         st.dataframe(
             df.assign(
                 mid=df["mid"].apply(lambda x: _pct(x) if x is not None else "—"),
@@ -672,9 +641,6 @@ with tabs[1]:
         else:
             st.caption("No concentration checks triggered yet.")
 
-# -----------------------------
-# Market detail
-# -----------------------------
 with tabs[2]:
     st.subheader("Market detail")
 
@@ -695,7 +661,7 @@ with tabs[2]:
             st.write("Token ID (YES)")
             st.code(token_id)
 
-        st.markdown("### Price history (for baseline + visualization)")
+        st.markdown("### Price history")
         hist = clob_prices_history(token_id, interval=hist_interval, fidelity_min=int(fidelity))
         if hist.empty:
             st.info("No history returned for this token.")
