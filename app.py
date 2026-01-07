@@ -15,7 +15,7 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
 POLL_SECONDS = 30
-TILES_PER_ROW = 7  # fixed as requested
+TILES_PER_ROW = 4
 
 DEFAULT_SLUGS = [
     "khamenei-out-as-supreme-leader-of-iran-by-june-30-747",
@@ -26,13 +26,14 @@ DEFAULT_HEADERS = {
     "Accept": "application/json,text/plain,*/*",
 }
 
-# Trend/sparkline for dashboard: keep it light
+# Dashboard is light; details are heavier
 DASH_INTERVAL = "1d"
-DASH_FIDELITY_MIN = 5  # minutes
-
-# Details view: heavier history
+DASH_FIDELITY_MIN = 5
 DETAIL_INTERVAL = "max"
-DETAIL_FIDELITY_MIN = 30  # minutes
+DETAIL_FIDELITY_MIN = 30
+
+# Trend sensitivity
+DEADBAND = 0.0025  # 0.25%
 
 # =========================================================
 # HELPERS
@@ -70,35 +71,12 @@ def extract_yes_no_tokens(market: dict) -> Tuple[Optional[str], Optional[str]]:
         return toks[0], None
     return None, None
 
-def leaning_label(p: Optional[float]) -> str:
-    if p is None:
-        return "—"
-    return "Leans YES" if p > 0.5 else "Leans NO" if p < 0.5 else "Even"
-
-def trend_label(delta: Optional[float], deadband: float = 0.0025) -> str:
-    if delta is None or not np.isfinite(delta):
-        return "—"
-    if delta > deadband:
-        return "Trending YES"
-    if delta < -deadband:
-        return "Trending NO"
-    return "Flat"
-
-def trend_icon(delta: Optional[float], deadband: float = 0.0025) -> str:
-    if delta is None or not np.isfinite(delta):
-        return "•"
-    if delta > deadband:
-        return "↑"
-    if delta < -deadband:
-        return "↓"
-    return "→"
-
 def clamp01(x: Optional[float]) -> float:
     if x is None or not np.isfinite(x):
         return 0.0
     return float(max(0.0, min(1.0, x)))
 
-def compute_delta(hist: pd.DataFrame, lookback_minutes: int = 60) -> Optional[float]:
+def delta_1h_from_hist(hist: pd.DataFrame, lookback_minutes: int = 60) -> Optional[float]:
     if hist is None or hist.empty:
         return None
     now = pd.Timestamp.now(tz="UTC")
@@ -108,25 +86,30 @@ def compute_delta(hist: pd.DataFrame, lookback_minutes: int = 60) -> Optional[fl
     past = float(older.iloc[-1]["price"]) if not older.empty else float(hist.iloc[0]["price"])
     return current - past
 
-def pill(text: str, kind: str) -> str:
-    colors = {
-        "yes": ("#0f5132", "#d1e7dd"),
-        "no": ("#842029", "#f8d7da"),
-        "flat": ("#41464b", "#e2e3e5"),
-        "muted": ("#41464b", "#f1f3f5"),
-    }
-    fg, bg = colors.get(kind, colors["muted"])
+def trend_badge(delta: Optional[float]) -> str:
+    """
+    Minimal graphical trend:
+      - Up green ▲ for delta > deadband
+      - Down red ▼ for delta < -deadband
+      - Flat gray ▬ otherwise
+    Returns HTML snippet.
+    """
+    if delta is None or not np.isfinite(delta):
+        return """
+        <span style="font-size:16px;color:#6c757d;">•</span>
+        <span style="font-size:12px;color:#6c757d;margin-left:6px;">—</span>
+        """
+
+    if delta > DEADBAND:
+        icon, color = "▲", "#198754"  # green
+    elif delta < -DEADBAND:
+        icon, color = "▼", "#dc3545"  # red
+    else:
+        icon, color = "▬", "#6c757d"  # gray
+
     return f"""
-    <span style="
-      display:inline-block;
-      padding:2px 10px;
-      border-radius:999px;
-      font-size:12px;
-      color:{fg};
-      background:{bg};
-      border:1px solid rgba(0,0,0,0.08);
-      white-space:nowrap;
-    ">{text}</span>
+    <span style="font-size:16px;color:{color};font-weight:700;">{icon}</span>
+    <span style="font-size:12px;color:#6c757d;margin-left:6px;">Δ1h {pct(delta)}</span>
     """
 
 # =========================================================
@@ -190,12 +173,12 @@ async def fetch_snapshot(slug: str) -> Dict:
     if not yes_token:
         return {"slug": slug, "title": title, "error": "missing YES token id"}
 
-    # Concurrent I/O (threaded) for speed as you scale markets
+    # concurrent I/O
     mid_task = asyncio.to_thread(_sync_midpoint, yes_token)
     hist_task = asyncio.to_thread(_sync_history, yes_token, DASH_INTERVAL, DASH_FIDELITY_MIN)
     yes_mid, hist = await asyncio.gather(mid_task, hist_task)
 
-    delta_1h = compute_delta(hist, 60)
+    delta_1h = delta_1h_from_hist(hist, 60)
 
     return {
         "slug": slug,
@@ -206,9 +189,6 @@ async def fetch_snapshot(slug: str) -> Dict:
         "no_token": no_token,
         "yes_mid": yes_mid,
         "delta_1h": delta_1h,
-        "leaning": leaning_label(yes_mid),
-        "trend": trend_label(delta_1h),
-        "hist_light": hist,  # used for sparkline only
     }
 
 async def fetch_all(slugs: List[str]) -> List[Dict]:
@@ -223,35 +203,26 @@ def run_coro(coro):
 st.set_page_config(page_title="Polytracker", layout="wide")
 st.title("Polymarket Tracker")
 
-# Auto-refresh tick (non-blocking)
 st_autorefresh(interval=POLL_SECONDS * 1000, key="auto_refresh_polytracker")
 
-# Session defaults
+# Session state for toggle details
 if "selected_slug" not in st.session_state:
     st.session_state.selected_slug = None
 if "details_open" not in st.session_state:
     st.session_state.details_open = False
 
 with st.sidebar:
-    st.caption(f"Auto-refresh: every {POLL_SECONDS}s")
-    slugs_text = st.text_area(
-        "Market slugs (one per line)",
-        value="\n".join(DEFAULT_SLUGS),
-        height=160,
-    )
-    slugs = [s.strip() for s in slugs_text.splitlines() if s.strip()]
-    spark_points = st.slider("Sparkline points", 10, 120, 40, step=10)
-    show_meta = st.checkbox("Show end/vol on tiles", value=False)
-    debug = st.checkbox("Show debug", value=False)
+    st.header("Search / Add market (coming soon)")
+    _ = st.text_input("Search", value="", placeholder="Paste Polymarket URL or type keywords…", disabled=True)
+    st.caption("This panel will become your market search & add flow.")
 
-if not slugs:
-    st.info("Add at least one market slug.")
-    st.stop()
+# Hardcoded slugs for now (you can later replace this with search/add)
+slugs = DEFAULT_SLUGS
 
 with st.spinner(f"Fetching {len(slugs)} market(s)..."):
     snapshots = run_coro(fetch_all(slugs))
 
-# Build widget-safe lookup
+# Split errors vs ok
 by_slug: Dict[str, Dict] = {}
 errors: List[Dict] = []
 for s in snapshots:
@@ -261,7 +232,7 @@ for s in snapshots:
         by_slug[s["slug"]] = s
 
 # =========================================================
-# DASHBOARD (TILES, 7 PER ROW)
+# DASHBOARD (TILES, 4 PER ROW)
 # =========================================================
 st.subheader("Dashboard")
 
@@ -279,62 +250,36 @@ def render_tile(m: Dict):
     yes_mid = m.get("yes_mid")
     delta = m.get("delta_1h")
 
-    lean = m.get("leaning", "—")
-    if lean == "Leans YES":
-        lean_pill = pill(lean, "yes")
-    elif lean == "Leans NO":
-        lean_pill = pill(lean, "no")
-    elif lean == "Even":
-        lean_pill = pill(lean, "flat")
-    else:
-        lean_pill = pill(lean, "muted")
-
-    tr = m.get("trend", "—")
-    tr_icon = trend_icon(delta)
-    if tr == "Trending YES":
-        tr_pill = pill(f"{tr_icon} {tr}", "yes")
-    elif tr == "Trending NO":
-        tr_pill = pill(f"{tr_icon} {tr}", "no")
-    elif tr == "Flat":
-        tr_pill = pill(f"{tr_icon} {tr}", "flat")
-    else:
-        tr_pill = pill(f"{tr_icon} {tr}", "muted")
-
     with st.container(border=True):
+        # Title
         st.markdown(f"**{m.get('title','(no title)')}**")
 
-        a, b = st.columns([1, 1])
-        with a:
-            st.markdown(lean_pill, unsafe_allow_html=True)
-        with b:
-            st.markdown(tr_pill, unsafe_allow_html=True)
+        # Minimal trend indicator (graphical)
+        st.markdown(trend_badge(delta), unsafe_allow_html=True)
 
-        c1, c2 = st.columns([1, 1])
-        with c1:
+        # YES/NO + bar
+        a, b = st.columns(2)
+        with a:
             st.metric("YES", pct(yes_mid))
-        with c2:
+        with b:
             st.metric("NO", pct(1 - yes_mid if yes_mid is not None else None))
 
         st.progress(clamp01(yes_mid))
-        st.caption(f"Δ 1h: {pct(delta)}")
 
-        if show_meta:
-            st.caption(f"End: {m.get('end_date','—')} • Vol: {m.get('volume','—')}")
+        # Toggle button
+        is_open = st.session_state.details_open and st.session_state.selected_slug == m["slug"]
+        label = "Hide details" if is_open else "View details"
 
-        # light sparkline
-        hist = m.get("hist_light")
-        if isinstance(hist, pd.DataFrame) and not hist.empty:
-            tail = hist.tail(int(spark_points)).set_index("ts")["price"]
-            st.line_chart(tail, height=90)
-        else:
-            st.caption("No history")
+        if st.button(label, key=f"toggle_{m['slug']}"):
+            # if clicking the currently-open tile -> close
+            if is_open:
+                st.session_state.details_open = False
+                st.session_state.selected_slug = None
+            else:
+                st.session_state.details_open = True
+                st.session_state.selected_slug = m["slug"]
 
-        # Clicking this should open details expander and load details lazily
-        if st.button("View details", key=f"view_{m['slug']}"):
-            st.session_state.selected_slug = m["slug"]
-            st.session_state.details_open = True
-
-# Create unlimited rows of 7 tiles
+# Grid with unlimited rows
 for i in range(0, len(items), TILES_PER_ROW):
     row = st.columns(TILES_PER_ROW, gap="small")
     for j in range(TILES_PER_ROW):
@@ -344,47 +289,42 @@ for i in range(0, len(items), TILES_PER_ROW):
         with row[j]:
             render_tile(items[idx])
 
-st.caption("Leaning = YES vs 50%. Trend = change in YES probability over the last hour (from price history).")
-
 # =========================================================
-# DETAILS (COLLAPSED + LAZY)
+# DETAILS (COLLAPSED + LAZY LOAD)
 # =========================================================
 with st.expander("Details", expanded=bool(st.session_state.details_open)):
-    if not st.session_state.selected_slug or st.session_state.selected_slug not in by_slug:
-        st.info("Click **View details** on a tile to load the detailed view.")
+    if not st.session_state.details_open or not st.session_state.selected_slug:
+        st.info("Click **View details** on any tile to load details.")
     else:
-        pick_slug = st.session_state.selected_slug
-        pick = by_slug[pick_slug]
+        slug = st.session_state.selected_slug
+        pick = by_slug.get(slug)
 
-        yes_mid = pick.get("yes_mid")
-        delta = pick.get("delta_1h")
-
-        st.markdown(f"### {pick.get('title')}")
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("YES (now)", pct(yes_mid))
-        c2.metric("Leaning", pick.get("leaning", "—"))
-        c3.metric("Trend (1h)", pick.get("trend", "—"), delta=pct(delta))
-
-        st.write(f"End date: {pick.get('end_date')}")
-        st.write(f"Volume: {pick.get('volume')}")
-
-        # Lazy-load heavy history ONLY when expander is opened via View details
-        st.markdown("#### YES price history (max, 30m fidelity)")
-        with st.spinner("Loading detailed history..."):
-            hist_full = detail_history_cached(pick["yes_token"])
-
-        if isinstance(hist_full, pd.DataFrame) and not hist_full.empty:
-            st.line_chart(hist_full.set_index("ts")["price"], height=260)
+        if not pick:
+            st.warning("Selected market is no longer available.")
         else:
-            st.info("No detailed history returned.")
+            yes_mid = pick.get("yes_mid")
+            delta = pick.get("delta_1h")
 
-        # Optional: allow closing the expander state
-        colA, colB = st.columns([1, 3])
-        with colA:
-            if st.button("Close details"):
+            st.markdown(f"### {pick.get('title')}")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("YES (now)", pct(yes_mid))
+            c2.metric("NO (now)", pct(1 - yes_mid if yes_mid is not None else None))
+            c3.markdown(trend_badge(delta), unsafe_allow_html=True)
+
+            st.write(f"End date: {pick.get('end_date')}")
+            st.write(f"Volume: {pick.get('volume')}")
+
+            st.markdown("#### YES price history (max, 30m fidelity)")
+            with st.spinner("Loading detailed history..."):
+                hist_full = detail_history_cached(pick["yes_token"])
+
+            if isinstance(hist_full, pd.DataFrame) and not hist_full.empty:
+                st.line_chart(hist_full.set_index("ts")["price"], height=300)
+            else:
+                st.info("No detailed history returned.")
+
+            # convenience close
+            if st.button("Close details panel"):
                 st.session_state.details_open = False
-
-        if debug:
-            st.markdown("#### Debug snapshot")
-            st.json({k: v for k, v in pick.items() if k != "hist_light"})
+                st.session_state.selected_slug = None
