@@ -1,7 +1,7 @@
 import json
-import time
 from typing import Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -12,8 +12,11 @@ import streamlit as st
 GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
-# This is the exact Polymarket event slug from your URL:
-MARKET_SLUG = "khamenei-out-as-supreme-leader-of-iran-by-june-30-747"
+# Your market (from the URL you shared)
+MARKET_SLUG_DEFAULT = "khamenei-out-as-supreme-leader-of-iran-by-june-30-747"
+
+# Fixed polling interval (per your request)
+POLL_SECONDS = 30
 
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Streamlit) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36",
@@ -29,16 +32,13 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
-def _pct(x: Optional[float]) -> str:
+def _pct(x: Optional[float], digits: int = 2) -> str:
     if x is None:
         return "—"
-    return f"{x * 100:.2f}%"
+    return f"{x * 100:.{digits}f}%"
 
 def _as_list(x) -> list:
-    """
-    Gamma sometimes returns list fields as actual lists, or JSON-encoded strings.
-    Normalize to a Python list.
-    """
+    """Normalize list-ish fields (actual list or JSON-encoded list string)."""
     if x is None:
         return []
     if isinstance(x, list):
@@ -53,25 +53,39 @@ def _as_list(x) -> list:
     return []
 
 def extract_yes_no_token_ids(market: dict) -> Tuple[Optional[str], Optional[str]]:
-    toks = (
-        market.get("clobTokenIds")
-        or market.get("clob_token_ids")
-        or market.get("clobTokenIDs")
-    )
+    toks = market.get("clobTokenIds") or market.get("clob_token_ids") or market.get("clobTokenIDs")
     toks_list = [str(t) for t in _as_list(toks) if t not in (None, "", "null")]
     yes_id = toks_list[0] if len(toks_list) >= 1 else None
     no_id = toks_list[1] if len(toks_list) >= 2 else None
     return yes_id, no_id
+
+def _lean_label(p_yes: Optional[float]) -> str:
+    if p_yes is None:
+        return "—"
+    if p_yes > 0.5:
+        return "Leans YES"
+    if p_yes < 0.5:
+        return "Leans NO"
+    return "Even"
+
+def _trend_label(delta: Optional[float], deadband: float = 0.0025) -> str:
+    """
+    delta is (current - past). deadband avoids flip-flopping on tiny moves.
+    """
+    if delta is None or not np.isfinite(delta):
+        return "—"
+    if delta > deadband:
+        return "Trending YES"
+    if delta < -deadband:
+        return "Trending NO"
+    return "Flat"
 
 # -----------------------------
 # API (cached)
 # -----------------------------
 @st.cache_data(ttl=900)
 def gamma_market_by_slug(slug: str) -> Optional[dict]:
-    """
-    Full market object (includes conditionId, clobTokenIds, etc.)
-    GET https://gamma-api.polymarket.com/markets/slug/{slug}
-    """
+    """GET https://gamma-api.polymarket.com/markets/slug/{slug}"""
     r = requests.get(
         f"{GAMMA_BASE}/markets/slug/{slug}",
         timeout=25,
@@ -86,10 +100,7 @@ def gamma_market_by_slug(slug: str) -> Optional[dict]:
 
 @st.cache_data(ttl=15)
 def clob_midpoint(token_id: str) -> Optional[float]:
-    """
-    GET https://clob.polymarket.com/midpoint?token_id=...
-    -> {"mid":"0.1234"} (string)
-    """
+    """GET https://clob.polymarket.com/midpoint?token_id=... -> {"mid":"0.1234"}"""
     r = requests.get(
         f"{CLOB_BASE}/midpoint",
         params={"token_id": token_id},
@@ -121,32 +132,45 @@ def clob_prices_history(token_id: str, interval: str = "1w", fidelity_min: int =
     df["price"] = pd.to_numeric(df["p"], errors="coerce")
     return df[["ts", "price"]].dropna().sort_values("ts")
 
+def compute_trend_from_history(hist: pd.DataFrame, lookback_minutes: int = 60) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Returns (current_price, delta_vs_lookback).
+    delta = current - price_at_or_before(now - lookback)
+    """
+    if hist is None or hist.empty:
+        return None, None
+
+    hist = hist.dropna().sort_values("ts")
+    current = float(hist.iloc[-1]["price"])
+
+    target = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(minutes=lookback_minutes)
+    older = hist[hist["ts"] <= target]
+    past = float(older.iloc[-1]["price"]) if not older.empty else float(hist.iloc[0]["price"])
+    return current, (current - past)
+
 # -----------------------------
-# Streamlit UI (minimal)
+# Streamlit UI
 # -----------------------------
-st.set_page_config(page_title="Polytracker (Single Market)", layout="wide")
-st.title("Polymarket Tracker — Single Market (Minimal)")
+st.set_page_config(page_title="Polytracker — Single Market", layout="wide")
+st.title("Polymarket Tracker")
 
-with st.sidebar:
-    st.header("Settings")
-    slug = st.text_input("Market slug", value=MARKET_SLUG)
-    poll_seconds = st.slider("Polling interval (seconds)", 10, 300, 30, step=5)
-    show_debug = st.checkbox("Show debug (raw market JSON)", value=False)
-
-    st.divider()
-    if st.button("Force refresh now"):
-        st.cache_data.clear()
-        st.success("Cache cleared. Reloading…")
-        st.rerun()
-
-# Auto-refresh (polling)
+# Fixed polling interval, no user setting
 try:
-    st.autorefresh(interval=poll_seconds * 1000, key="poll")
+    st.autorefresh(interval=POLL_SECONDS * 1000, key="poll")
 except Exception:
     pass
 
-market = gamma_market_by_slug(slug)
+# Sidebar: keep minimal controls, no polling slider
+with st.sidebar:
+    st.header("Market")
+    slug = st.text_input("Market slug", value=MARKET_SLUG_DEFAULT)
+    show_debug = st.checkbox("Show debug", value=False)
+    st.caption(f"Auto-refresh: every {POLL_SECONDS}s")
+    if st.button("Force refresh now"):
+        st.cache_data.clear()
+        st.rerun()
 
+market = gamma_market_by_slug(slug)
 if not market:
     st.error("Could not load market from Gamma. Check slug or network.")
     st.stop()
@@ -154,40 +178,56 @@ if not market:
 question = market.get("question") or "(no question)"
 end_date = market.get("endDateIso") or market.get("endDate") or "—"
 volume_num = market.get("volumeNum") or market.get("volume") or "—"
-last_trade = _safe_float(market.get("lastTradePrice"))
 
 yes_token, no_token = extract_yes_no_token_ids(market)
-
-st.subheader(question)
-colA, colB, colC, colD = st.columns(4)
-with colA:
-    st.metric("End date", str(end_date))
-with colB:
-    st.metric("Volume", str(volume_num))
-with colC:
-    st.metric("Last trade (Yes)", _pct(last_trade))
-with colD:
-    st.metric("Slug", slug)
-
 if not yes_token:
     st.error("This market did not return a usable YES token id (clobTokenIds).")
     if show_debug:
         st.json(market)
     st.stop()
 
-# Current prices
+# --- Top-level DASHBOARD ---
+st.subheader("Dashboard")
+
+# Pull current midpoint and recent history to compute trend
 yes_mid = clob_midpoint(yes_token)
-no_mid = (1.0 - yes_mid) if yes_mid is not None else None
+# Use 1w window with 15m fidelity for a stable, cheap trend signal
+hist_for_trend = clob_prices_history(yes_token, interval="1w", fidelity_min=15)
+cur_hist, delta_60m = compute_trend_from_history(hist_for_trend, lookback_minutes=60)
 
-c1, c2, c3 = st.columns(3)
+lean = _lean_label(yes_mid)
+trend = _trend_label(delta_60m, deadband=0.0025)
+
+c1, c2, c3, c4 = st.columns(4)
 with c1:
-    st.metric("YES midpoint", _pct(yes_mid))
+    st.metric("Market", question)  # title only, no slug shown on page
 with c2:
-    st.metric("NO midpoint", _pct(no_mid))
+    st.metric("Leaning", lean)
 with c3:
-    st.caption("Midpoints are polled from the free CLOB endpoint.")
+    st.metric("Trend (1h)", trend, delta=_pct(delta_60m, 2) if delta_60m is not None else None)
+with c4:
+    # show the actual current probability too (use midpoint; fallback to history last)
+    p = yes_mid if yes_mid is not None else cur_hist
+    st.metric("YES (now)", _pct(p))
 
-# History chart (YES)
+st.caption("Lean = whether YES is above or below 50%. Trend = change in YES over the last hour (from price history).")
+
+st.divider()
+
+# --- Detailed page content (below) ---
+st.subheader("Details")
+
+colA, colB, colC = st.columns(3)
+with colA:
+    st.metric("YES midpoint", _pct(yes_mid))
+with colB:
+    no_mid = (1.0 - yes_mid) if yes_mid is not None else None
+    st.metric("NO midpoint", _pct(no_mid))
+with colC:
+    st.metric("End date", str(end_date))
+
+st.write(f"Volume: {volume_num}")
+
 st.markdown("### YES price history")
 hist_interval = st.selectbox("History window", ["1d", "1w", "max"], index=1)
 fidelity = st.selectbox("Fidelity (minutes)", [1, 2, 5, 10, 15, 30, 60], index=4)
